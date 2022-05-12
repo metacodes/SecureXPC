@@ -115,7 +115,8 @@ import Foundation
 /// - ``registerRoute(_:handler:)-6sxby``
 /// - ``registerRoute(_:handler:)-qcox``
 /// ### Configuring a Server
-/// - ``targetQueue``
+/// - ``handlerConcurrency-swift.property``
+/// - ``HandlerConcurrency-swift.enum``
 /// - ``setErrorHandler(_:)-lex4``
 /// - ``setErrorHandler(_:)-1r3up``
 /// ### Starting a Server
@@ -126,47 +127,50 @@ import Foundation
 /// - ``XPCNonBlockingServer/endpoint``
 public class XPCServer {
     
-    /// Set of weak references to connections, used to update their dispatch queues.
-    private var connections = Set<WeakConnection>()
+    /// The concurrency model used when running registered handlers.
+    public enum HandlerConcurrency {
+        /// Requests will be routed to handlers concurrently without regard to the originating client.
+        case concurrent
+        /// Requests will be routed such that only one handler is running simultaneously per originating client.
+        ///
+        /// Handlers may be called concurrently when requests originate from different clients.
+        ///
+        /// Requests will be procesed in the order in which they are received by the server; however, this is not guaranteed to match the order in which `send`
+        /// or `sendMessage` calls are made by an ``XPCClient`` due to their asynchronous nature. If a client requires a server to receive requests in a
+        /// specific order, it must wait until a `send` or `sendMessage` call has completed before calling the next one.
+        case serialPerClient
+        /// Requests will be routed such that only one handler is running simultaneously per server.
+        ///
+        /// Handlers may be called concurrently if they are registered with multiple servers.
+        ///
+        /// Requests will be procesed in the order in which they are received by the server; however, this is not guaranteed to match the order in which `send` or
+        /// `sendMessage` calls are made by an ``XPCClient`` due to their asynchronous nature nor is there any guaranteed ordering from calls made by
+        /// multiple clients. If a client requires a server to receive requests in a specific order, it must wait until a `send` or `sendMessage` call has completed
+        /// before calling the next one.
+        case serialPerServer
+    }
     
-    /// Weak wrapper around a connection stored in the `connections` variable.
+    /// Governs how incoming requests are scheduled with registered handlers.
     ///
-    /// Designed to be conveniently settable as the context of an `xpc_connection_t` so that it's accessible from its finalizer.
-    fileprivate class WeakConnection: Hashable {
-        private weak var server: XPCServer?
-        fileprivate weak var connection: xpc_connection_t?
-        private let id = UUID()
-        
-        init(_ connection: xpc_connection_t, server: XPCServer) {
-            self.connection = connection
-            self.server = server
+    /// By default handlers are scheduled with ``HandlerConcurrency-swift.enum/concurrent``. Scheduling applies to both synchronous and
+    /// `async` handlers.
+    ///
+    /// This property is thread-safe and can be updated at any time both before and after the server has been started. However, after the server has been started
+    /// when setting a new value the scheduling behavior is undefined for received requests which have not yet had their handler run to completion.
+    public var handlerConcurrency: HandlerConcurrency {
+        get {
+            self.requestQueue.getHandlerConcurrency()
         }
-        
-        func removeFromContainer() {
-            self.server?.connections.remove(self)
-        }
-        
-        static func == (lhs: XPCServer.WeakConnection, rhs: XPCServer.WeakConnection) -> Bool {
-            lhs.id == rhs.id
-        }
-        
-        func hash(into hasher: inout Hasher) {
-            self.id.hash(into: &hasher)
+        set(concurrency) {
+            self.requestQueue.setHandlerConcurrency(concurrency)
         }
     }
+    
+    /// Stores and schedules all incoming requests and their associated handler.
+    private let requestQueue = RequestQueue(handlerConcurrency: .concurrent)
     
     /// Used to determine whether an incoming XPC message from a client should be processed and handed off to a registered route.
     internal let messageAcceptor: MessageAcceptor
-    
-    /// The queue used to run the handlers associated with registered routes.
-    ///
-    /// Applying the target queue is asynchronous and non-preemptive and therefore will not interrupt the execution of an already-running handler. The queue
-    /// returned from reading this property will always be the one most recently set even if it is not yet the queue used to run handlers for all incoming requests.
-    public var targetQueue: DispatchQueue? {
-        willSet {
-            connections.compactMap{ $0.connection }.forEach{ xpc_connection_set_target_queue($0, newValue) }
-        }
-    }
     
     internal init(messageAcceptor: MessageAcceptor) {
         self.messageAcceptor = messageAcceptor
@@ -352,27 +356,9 @@ public class XPCServer {
         xpc_connection_set_event_handler(connection, { event in
             self.handleEvent(connection: connection, event: event)
         })
-        xpc_connection_set_target_queue(connection, self.targetQueue)
-        self.addConnection(connection)
+
+        // Start the connection
         xpc_connection_resume(connection)
-    }
-    
-    private func addConnection(_ connection: xpc_connection_t) {
-        // Keep a weak reference to the connection and this server, setting this as the context on the connection
-        let weakConnection = WeakConnection(connection, server: self)
-        self.connections.insert(weakConnection)
-        xpc_connection_set_context(connection, Unmanaged.passRetained(weakConnection).toOpaque())
-        
-        // The finalizer is called when the connection's retain count has reached zero, so now we need to remove the
-        // wrapper from the containing connections array
-        xpc_connection_set_finalizer_f(connection, { opaqueWeakConnection in
-            guard let opaqueWeakConnection = opaqueWeakConnection else {
-                fatalError("Connection with retain count of zero is missing context, this should never happen")
-            }
-            
-            let weakConnection = Unmanaged<WeakConnection>.fromOpaque(opaqueWeakConnection).takeRetainedValue()
-            weakConnection.removeFromContainer()
-        })
     }
     
     private func handleEvent(connection: xpc_connection_t, event: xpc_object_t) {
@@ -381,12 +367,12 @@ public class XPCServer {
         // Note that we're intentionally not checking for message acceptance as errors generated by libxpc can fail to
         // meet the acceptor's criteria because they're not coming from the client.
         guard xpc_get_type(event) == XPC_TYPE_DICTIONARY else {
-            self.errorHandler.handle(XPCError.fromXPCObject(event))
+            self.serverErrorHandler.handle(XPCError.fromXPCObject(event))
             return
         }
         
         guard self.messageAcceptor.acceptMessage(connection: connection, message: event) else {
-            self.errorHandler.handle(.insecure)
+            self.serverErrorHandler.handle(.insecure)
             return
         }
         self.handleMessage(connection: connection, message: event)
@@ -409,45 +395,21 @@ public class XPCServer {
             return
         }
         
-        if let handler = handler as? XPCHandlerSync {
-            XPCRequestContext.setForCurrentThread(connection: connection, message: message) {
-                var reply = handler.shouldCreateReply ? xpc_dictionary_create_reply(message) : nil
-                do {
-                    try handler.handle(request: request, server: self, connection: connection, reply: &reply)
-                    try maybeSendReply(&reply, request: request, connection: connection)
-                } catch {
-                    var reply = handler.shouldCreateReply ? reply : xpc_dictionary_create_reply(message)
-                    self.handleError(error, request: request, connection: connection, reply: &reply)
-                }
-            }
-        } else if #available(macOS 10.15.0, *), let handler = handler as? XPCHandlerAsync {
-            XPCRequestContext.setForTask(connection: connection, message: message) {
-                Task {
-                    var reply = handler.shouldCreateReply ? xpc_dictionary_create_reply(message) : nil
-                    do {
-                        try await handler.handle(request: request, server: self, connection: connection, reply: &reply)
-                        try maybeSendReply(&reply, request: request, connection: connection)
-                    } catch {
-                        var reply = handler.shouldCreateReply ? reply : xpc_dictionary_create_reply(message)
-                        self.handleError(error, request: request, connection: connection, reply: &reply)
-                    }
-                }
-            }
-        } else {
-            fatalError("Non-sync handler for route \(request.route.pathComponents) was found, but only sync routes " +
-                       "should be registrable on this OS version. Handler: \(handler)")
+        self.requestQueue.enqueue(request: request, handler: handler, connection: connection) { [weak self] in
+            // Wrap the error handler function such that it doesn't retain this server instance
+            self?.handleError($0, request: $1, connection: $2, reply: &$3)
         }
     }
     
     // MARK: Error handling
     
-    var errorHandler = ErrorHandler.none
+    private var serverErrorHandler = ServerErrorHandler.none
     
     /// Sets a handler to synchronously receive any errors encountered.
     ///
     /// This will replace any previously set error handler, including an asynchronous one.
     public func setErrorHandler(_ handler: @escaping (XPCError) -> Void) {
-        self.errorHandler = .sync(handler)
+        self.serverErrorHandler = .sync(handler)
     }
     
     /// Sets a handler to asynchronously receive any errors encountered.
@@ -455,34 +417,26 @@ public class XPCServer {
     /// This will replace any previously set error handler, including a synchronous one.
     @available(macOS 10.15.0, *)
     public func setErrorHandler(_ handler: @escaping (XPCError) async -> Void) {
-        self.errorHandler = .async(handler)
+        self.serverErrorHandler = .async(handler)
     }
     
     private func handleError(
         _ error: Error,
         request: Request?,
-        connection: xpc_connection_t,
+        connection: xpc_connection_t?,
         reply: inout xpc_object_t?
     ) {
         let error = XPCError.asXPCError(error: error)
-        self.errorHandler.handle(error)
+        self.serverErrorHandler.handle(error)
         
         // If it's possible to reply, then send the error back to the client
-        if var nonNilReply = reply {
+        if var nonNilReply = reply, let connection = connection {
             do {
                 try Response.encodeError(error, intoReply: &nonNilReply)
                 try maybeSendReply(&reply, request: request, connection: connection)
             } catch {
                 // If these actions fail, then there's no way to proceed
             }
-        }
-    }
-    
-    /// Tries to send a reply if the `reply` and `request` objects aren't nil.
-    private func maybeSendReply(_ reply: inout xpc_object_t?, request: Request?, connection: xpc_connection_t) throws {
-        if var reply = reply, let request = request {
-            try Response.encodeRequestID(request.requestID, intoReply: &reply)
-            xpc_connection_send_message(connection, reply)
         }
     }
 
@@ -682,6 +636,16 @@ extension XPCServer {
     }
 }
 
+// MARK: Helper functions
+
+/// Tries to send a reply if the `reply` and `request` objects aren't nil.
+fileprivate func maybeSendReply(_ reply: inout xpc_object_t?, request: Request?, connection: xpc_connection_t) throws {
+    if var reply = reply, let request = request {
+        try Response.encodeRequestID(request.requestID, intoReply: &reply)
+        xpc_connection_send_message(connection, reply)
+    }
+}
+
 // MARK: handler function wrappers
 
 // These wrappers perform type erasure via their implemented protocols while internally maintaining type constraints
@@ -753,14 +717,24 @@ fileprivate extension XPCHandler {
 // MARK: sync handler function wrappers
 
 fileprivate protocol XPCHandlerSync: XPCHandler {
-    func handle(request: Request, server: XPCServer, connection: xpc_connection_t, reply: inout xpc_object_t?) throws
+    func handle(
+        request: Request,
+        handleError: @escaping HandleError,
+        connection: xpc_connection_t,
+        reply: inout xpc_object_t?
+    ) throws
 }
 
 fileprivate struct ConstrainedXPCHandlerWithoutMessageWithoutReplySync: XPCHandlerSync {
     var shouldCreateReply = true
     let handler: () throws -> Void
     
-    func handle(request: Request, server: XPCServer, connection: xpc_connection_t, reply: inout xpc_object_t?) throws {
+    func handle(
+        request: Request,
+        handleError: @escaping HandleError,
+        connection: xpc_connection_t,
+        reply: inout xpc_object_t?
+    ) throws {
         try checkRequest(request, reply: &reply, messageType: nil, replyType: nil, sequentialReplyType: nil)
         try HandlerError.rethrow { try self.handler() }
     }
@@ -770,7 +744,12 @@ fileprivate struct ConstrainedXPCHandlerWithMessageWithoutReplySync<M: Decodable
     var shouldCreateReply = true
     let handler: (M) throws -> Void
     
-    func handle(request: Request, server: XPCServer, connection: xpc_connection_t, reply: inout xpc_object_t?) throws {
+    func handle(
+        request: Request,
+        handleError: @escaping HandleError,
+        connection: xpc_connection_t,
+        reply: inout xpc_object_t?
+    ) throws {
         try checkRequest(request, reply: &reply, messageType: M.self, replyType: nil, sequentialReplyType: nil)
         let decodedMessage = try request.decodePayload(asType: M.self)
         try HandlerError.rethrow { try self.handler(decodedMessage) }
@@ -781,7 +760,12 @@ fileprivate struct ConstrainedXPCHandlerWithoutMessageWithReplySync<R: Encodable
     var shouldCreateReply = true
     let handler: () throws -> R
     
-    func handle(request: Request, server: XPCServer, connection: xpc_connection_t, reply: inout xpc_object_t?) throws {
+    func handle(
+        request: Request,
+        handleError: @escaping HandleError,
+        connection: xpc_connection_t,
+        reply: inout xpc_object_t?
+    ) throws {
         try checkRequest(request, reply: &reply, messageType: nil, replyType: R.self, sequentialReplyType: nil)
         let payload = try HandlerError.rethrow { try self.handler() }
         try Response.encodePayload(payload, intoReply: &reply!)
@@ -792,7 +776,12 @@ fileprivate struct ConstrainedXPCHandlerWithMessageWithReplySync<M: Decodable, R
     var shouldCreateReply = true
     let handler: (M) throws -> R
     
-    func handle(request: Request, server: XPCServer, connection: xpc_connection_t, reply: inout xpc_object_t?) throws {
+    func handle(
+        request: Request,
+        handleError: @escaping HandleError,
+        connection: xpc_connection_t,
+        reply: inout xpc_object_t?
+    ) throws {
         try checkRequest(request, reply: &reply, messageType: M.self, replyType: R.self, sequentialReplyType: nil)
         let decodedMessage = try request.decodePayload(asType: M.self)
         let payload = try HandlerError.rethrow { try self.handler(decodedMessage) }
@@ -804,9 +793,16 @@ fileprivate struct ConstrainedXPCHandlerWithoutMessageWithSequentialReplySync<S:
     var shouldCreateReply = false
     let handler: (SequentialResultProvider<S>) -> Void
     
-    func handle(request: Request, server: XPCServer, connection: xpc_connection_t, reply: inout xpc_object_t?) throws {
+    func handle(
+        request: Request,
+        handleError: @escaping HandleError,
+        connection: xpc_connection_t,
+        reply: inout xpc_object_t?
+    ) throws {
         try checkRequest(request, reply: &reply, messageType: nil, replyType: nil, sequentialReplyType: S.self)
-        let sequenceProvider = SequentialResultProvider<S>(request: request, server: server, connection: connection)
+        let sequenceProvider = SequentialResultProvider<S>(request: request,
+                                                           errorHandler: handleError,
+                                                           connection: connection)
         self.handler(sequenceProvider)
     }
 }
@@ -815,9 +811,16 @@ fileprivate struct ConstrainedXPCHandlerWithMessageWithSequentialReplySync<M: De
     var shouldCreateReply = false
     let handler: (M, SequentialResultProvider<S>) -> Void
     
-    func handle(request: Request, server: XPCServer, connection: xpc_connection_t, reply: inout xpc_object_t?) throws {
+    func handle(
+        request: Request,
+        handleError: @escaping HandleError,
+        connection: xpc_connection_t,
+        reply: inout xpc_object_t?
+    ) throws {
         try checkRequest(request, reply: &reply, messageType: M.self, replyType: nil, sequentialReplyType: S.self)
-        let sequenceProvider = SequentialResultProvider<S>(request: request, server: server, connection: connection)
+        let sequenceProvider = SequentialResultProvider<S>(request: request,
+                                                           errorHandler: handleError,
+                                                           connection: connection)
         let decodedMessage = try request.decodePayload(asType: M.self)
         self.handler(decodedMessage, sequenceProvider)
     }
@@ -829,7 +832,7 @@ fileprivate struct ConstrainedXPCHandlerWithMessageWithSequentialReplySync<M: De
 fileprivate protocol XPCHandlerAsync: XPCHandler {
     func handle(
         request: Request,
-        server: XPCServer,
+        handleError: @escaping HandleError,
         connection: xpc_connection_t,
         reply: inout xpc_object_t?
     ) async throws
@@ -842,7 +845,7 @@ fileprivate struct ConstrainedXPCHandlerWithoutMessageWithoutReplyAsync: XPCHand
     
     func handle(
         request: Request,
-        server: XPCServer,
+        handleError: @escaping HandleError,
         connection: xpc_connection_t,
         reply: inout xpc_object_t?
     ) async throws {
@@ -858,7 +861,7 @@ fileprivate struct ConstrainedXPCHandlerWithMessageWithoutReplyAsync<M: Decodabl
     
     func handle(
         request: Request,
-        server: XPCServer,
+        handleError: @escaping HandleError,
         connection: xpc_connection_t,
         reply: inout xpc_object_t?
     ) async throws {
@@ -875,7 +878,7 @@ fileprivate struct ConstrainedXPCHandlerWithoutMessageWithReplyAsync<R: Encodabl
     
     func handle(
         request: Request,
-        server: XPCServer,
+        handleError: @escaping HandleError,
         connection: xpc_connection_t,
         reply: inout xpc_object_t?
     ) async throws {
@@ -892,7 +895,7 @@ fileprivate struct ConstrainedXPCHandlerWithMessageWithReplyAsync<M: Decodable, 
     
     func handle(
         request: Request,
-        server: XPCServer,
+        handleError: @escaping HandleError,
         connection: xpc_connection_t,
         reply: inout xpc_object_t?
     ) async throws {
@@ -910,12 +913,14 @@ fileprivate struct ConstrainedXPCHandlerWithoutMessageWithSequentialReplyAsync<S
     
     func handle(
         request: Request,
-        server: XPCServer,
+        handleError: @escaping HandleError,
         connection: xpc_connection_t,
         reply: inout xpc_object_t?
     ) async throws {
         try checkRequest(request, reply: &reply, messageType: nil, replyType: nil, sequentialReplyType: S.self)
-        let sequenceProvider = SequentialResultProvider<S>(request: request, server: server, connection: connection)
+        let sequenceProvider = SequentialResultProvider<S>(request: request,
+                                                           errorHandler: handleError,
+                                                           connection: connection)
         await self.handler(sequenceProvider)
     }
 }
@@ -927,12 +932,14 @@ fileprivate struct ConstrainedXPCHandlerWithMessageWithSequentialReplyAsync<M: D
     
     func handle(
         request: Request,
-        server: XPCServer,
+        handleError: @escaping HandleError,
         connection: xpc_connection_t,
         reply: inout xpc_object_t?
     ) async throws {
         try checkRequest(request, reply: &reply, messageType: M.self, replyType: nil, sequentialReplyType: S.self)
-        let sequenceProvider = SequentialResultProvider<S>(request: request, server: server, connection: connection)
+        let sequenceProvider = SequentialResultProvider<S>(request: request,
+                                                           errorHandler: handleError,
+                                                           connection: connection)
         let decodedMessage = try request.decodePayload(asType: M.self)
         await self.handler(decodedMessage, sequenceProvider)
     }
@@ -940,8 +947,10 @@ fileprivate struct ConstrainedXPCHandlerWithMessageWithSequentialReplyAsync<M: D
 
 // MARK: Error Handler
 
+typealias HandleError = (Error, Request?, xpc_connection_t?, inout xpc_object_t?) -> Void
+
 /// Wrapper around an error handling closure to ensure there's only ever one error handler regardless of whether it's synchronous or asynchronous.
-enum ErrorHandler {
+fileprivate enum ServerErrorHandler {
     case none
     case sync((XPCError) -> Void)
     case async((XPCError) async -> Void)
@@ -961,5 +970,183 @@ enum ErrorHandler {
                     fatalError("async error handler was set on macOS prior to 10.15, this should not be possible")
                 }
         }
+    }
+}
+
+// MARK: Request Queue & RequestRunner
+
+fileprivate class RequestQueue {
+    /// All scheduling of requests is performed serially on this queue to ensure consistency
+    private let serialCoordinationQueue = DispatchQueue(label: "RequestQueue - Serial Coordination Queue")
+    
+    /// Setting this on the `serialCoordinationQueue` allows for checking later if we're actually running on this queue.
+    private let serialCoordinationKey = DispatchSpecificKey<String>()
+    
+    /// Requests which have not yet been dispatched to run asynchronously, either on a global dispatch queue or as a `Task`.
+    private var pendingRequests = [RequestRunner]()
+    
+    /// Requests which have been dispatched to run asynchronously, either on a global dispatch queue or as a `Task`.
+    ///
+    /// Just because a request has been dispatched does not mean it has necessarily started running yet. Once it is done running, it will be removed from this set.
+    private var inflightRequests = Set<RequestRunner>()
+    
+    /// The concurrency setting governing this queue. Accessed and updated by the ``XPCServer`` via the `set` and `get` functions to ensure these
+    /// operations are run on the `serialCoordinationQueue`.
+    private var handlerConcurrency: XPCServer.HandlerConcurrency
+    
+    init(handlerConcurrency: XPCServer.HandlerConcurrency) {
+        self.handlerConcurrency = handlerConcurrency
+        self.serialCoordinationQueue.setSpecific(key: self.serialCoordinationKey, value: "")
+    }
+    
+    /// Asynchronously updates the concurrency setting and revaluates any pending requests as a result of this change.
+    func setHandlerConcurrency(_ handlerConcurrency: XPCServer.HandlerConcurrency) {
+        self.serialCoordinationQueue.async {
+            if self.handlerConcurrency != handlerConcurrency {
+                self.handlerConcurrency = handlerConcurrency
+                self.reevaluatePendingRequests()
+            }
+        }
+    }
+    
+    /// Synchronously returns the current concurrency setting.
+    func getHandlerConcurrency() -> XPCServer.HandlerConcurrency {
+        self.serialCoordinationQueue.sync {
+            self.handlerConcurrency
+        }
+    }
+    
+    /// Enqueues the request and associated information at the end of the pending requests and revaluates all pending requests.
+    ///
+    /// - Parameters:
+    ///   - request: A request to be processed.
+    ///   - handler: A handler which should process this `request`.
+    ///   - connection: A connection for which any replies must be sent over.
+    ///   - errorHandler: A closure with which to provide any errors that occur while processing a request.
+    func enqueue(
+        request: Request,
+        handler: XPCHandler,
+        connection: xpc_connection_t,
+        errorHandler: @escaping HandleError
+    ) {
+        self.serialCoordinationQueue.async {
+            let runner = RequestRunner(request: request,
+                                       handler: handler,
+                                       connection: connection,
+                                       handleError: errorHandler,
+                                       onCompletion: self.finishedRunning(_:))
+            // It's essential the request runner is always appended to the end so that ordering is maintained
+            self.pendingRequests.append(runner)
+            self.reevaluatePendingRequests()
+        }
+    }
+    
+    /// Must be called unconditionally by a request runner once it completes, whether in success or failure.
+    private func finishedRunning(_ runner: RequestRunner) {
+        self.serialCoordinationQueue.async {
+            self.inflightRequests.remove(runner)
+            self.reevaluatePendingRequests()
+        }
+    }
+    
+    /// Determines which pending requests, if any, should now be dispatched and does so.
+    ///
+    /// Specific behavior depends on the value of `handlerConcurrency`.
+    private func reevaluatePendingRequests() {
+        /// This must be called from the `serialCoordinationQueue`, but we don't want to wrap this in a call to
+        /// `self.serialCoordinationQueue.async { ... }` because we want it to run immediately as part of the a larger operation such as setting
+        /// `handlerConcurrency` or enqueuing a new request.
+        guard DispatchQueue.getSpecific(key: serialCoordinationKey) != nil else {
+            fatalError("reevaluatePendingRequests not called on \(serialCoordinationQueue)")
+        }
+        
+        switch self.handlerConcurrency {
+            // Run all pending requests
+            case .concurrent:
+                for runner in pendingRequests {
+                    inflightRequests.insert(runner)
+                    pendingRequests.removeAll{ $0 == runner }
+                    runner.run()
+                }
+            // Run the first request for each connection that doesn't already have a request inflight
+            case .serialPerClient:
+                var inflightConnections = Set<Int>(inflightRequests.map{ xpc_hash($0.connection) })
+                for runner in pendingRequests {
+                    let connectionHash = xpc_hash(runner.connection)
+                    if !inflightConnections.contains(connectionHash) {
+                        inflightConnections.insert(connectionHash)
+                        inflightRequests.insert(runner)
+                        pendingRequests.removeAll{ $0 == runner }
+                        runner.run()
+                    }
+                }
+            // Run the first pending request if there is one and there are no inflight requests
+            case .serialPerServer:
+                if inflightRequests.isEmpty, !pendingRequests.isEmpty {
+                    let runner = pendingRequests.removeFirst()
+                    inflightRequests.insert(runner)
+                    runner.run()
+                }
+        }
+    }
+}
+
+/// Runs a `Request` for a provided `XPCHandler`.
+///
+/// The request is either run on a `DispatchQueue` or as a `Task` depending on if it's a `XPCHandlerSync` or `XPCHandlerAsync`.
+fileprivate struct RequestRunner: Hashable {
+    let request: Request
+    let handler: XPCHandler
+    let connection: xpc_connection_t
+    let handleError: HandleError
+    let onCompletion: (RequestRunner) -> Void
+    
+    func run() {
+        if let handler = handler as? XPCHandlerSync {
+            DispatchQueue.global().async {
+                XPCRequestContext.setForCurrentThread(connection: connection, message: request.dictionary) {
+                    defer { onCompletion(self) }
+                    var reply = handler.shouldCreateReply ? xpc_dictionary_create_reply(request.dictionary) : nil
+                    do {
+                        try handler.handle(request: request,
+                                           handleError: handleError,
+                                           connection: connection,
+                                           reply: &reply)
+                        try maybeSendReply(&reply, request: request, connection: connection)
+                    } catch {
+                        var reply = handler.shouldCreateReply ? reply : xpc_dictionary_create_reply(request.dictionary)
+                        handleError(error, request, connection, &reply)
+                    }
+                }
+            }
+        } else if #available(macOS 10.15.0, *), let handler = handler as? XPCHandlerAsync {
+            XPCRequestContext.setForTask(connection: connection, message: request.dictionary) {
+                Task {
+                    defer { onCompletion(self) }
+                    var reply = handler.shouldCreateReply ? xpc_dictionary_create_reply(request.dictionary) : nil
+                    do {
+                        try await handler.handle(request: request,
+                                                 handleError: handleError,
+                                                 connection: connection,
+                                                 reply: &reply)
+                        try maybeSendReply(&reply, request: request, connection: connection)
+                    } catch {
+                        var reply = handler.shouldCreateReply ? reply : xpc_dictionary_create_reply(request.dictionary)
+                        handleError(error, request, connection, &reply)
+                    }
+                }
+            }
+        } else {
+            fatalError("Non-sync handler for route \(request.route.pathComponents) was found, but only sync routes " +
+                       "should be registrable on this OS version. Handler: \(handler)")
+        }
+    }
+    
+    static func == (lhs: RequestRunner, rhs: RequestRunner) -> Bool {
+        lhs.request.requestID == rhs.request.requestID
+    }
+    
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(self.request.requestID)
     }
 }

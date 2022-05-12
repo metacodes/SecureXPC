@@ -36,7 +36,7 @@ import Foundation
 /// - ``isFinished``
 public class SequentialResultProvider<S: Encodable> {
     private let request: Request
-    private weak var server: XPCServer?
+    private let handleError: (Error) -> Void
     private weak var connection: xpc_connection_t?
     private let serialQueue: DispatchQueue
     
@@ -48,9 +48,12 @@ public class SequentialResultProvider<S: Encodable> {
     /// ``SequentialResult/finished`` or ``SequentialResult/failure(_:)``.
     public private(set) var isFinished: Bool
     
-    init(request: Request, server: XPCServer, connection: xpc_connection_t) {
+    init(request: Request, errorHandler: @escaping HandleError, connection: xpc_connection_t) {
         self.request = request
-        self.server = server
+        self.handleError = { error in
+            var nilReply: xpc_object_t?
+            errorHandler(error, nil, nil, &nilReply)
+        }
         self.connection = connection
         self.isFinished = false
         self.serialQueue = DispatchQueue(label: "response-provider-\(request.requestID)")
@@ -67,7 +70,7 @@ public class SequentialResultProvider<S: Encodable> {
                 try Response.encodeRequestID(self.request.requestID, intoReply: &response)
                 xpc_connection_send_message(connection, response)
             } catch {
-                self.sendToServerErrorHandler(error)
+                self.handleError(error)
                 
                 // There's no point trying to send the encoding error to the client because encoding the requestID
                 // failed and that's needed by the client in order to properly reassociate the error with the request
@@ -105,7 +108,7 @@ public class SequentialResultProvider<S: Encodable> {
     /// - Parameter error: The error to be sent to the client and passed to the server's error handler.
     public func failure(error: Error) {
         let handlerError = HandlerError(error: error)
-        self.sendToServerErrorHandler(handlerError)
+        self.handleError(handlerError)
         
         self.sendResponse(isFinished: true) { response in
             try Response.encodeError(XPCError.handlerError(handlerError), intoReply: &response)
@@ -123,14 +126,14 @@ public class SequentialResultProvider<S: Encodable> {
     private func sendResponse(isFinished: Bool, encodingWork: @escaping (inout xpc_object_t) throws -> Void) {
         self.serialQueue.async {
             if self.isFinished {
-                self.sendToServerErrorHandler(XPCError.sequenceFinished)
+                self.handleError(XPCError.sequenceFinished)
                 return
             }
             
             self.isFinished = isFinished
             
             guard let connection = self.connection else {
-                self.sendToServerErrorHandler(XPCError.clientNotConnected)
+                self.handleError(XPCError.clientNotConnected)
                 return
             }
 
@@ -142,7 +145,7 @@ public class SequentialResultProvider<S: Encodable> {
                     try encodingWork(&response)
                     xpc_connection_send_message(connection, response)
                 } catch {
-                    self.sendToServerErrorHandler(error)
+                    self.handleError(error)
                     
                     do {
                         let errorResponse = xpc_dictionary_create(nil, nil, 0)
@@ -157,18 +160,12 @@ public class SequentialResultProvider<S: Encodable> {
             } catch {
                 // If we're not able to encode the requestID, there's no point sending back a response as the client
                 // wouldn't be able to make use of it
-                self.sendToServerErrorHandler(error)
+                self.handleError(error)
             }
             
             if isFinished {
                 self.endTransaction()
             }
-        }
-    }
-    
-    private func sendToServerErrorHandler(_ error: Error) {
-        if let server = server {
-            server.errorHandler.handle(XPCError.asXPCError(error: error))
         }
     }
     
